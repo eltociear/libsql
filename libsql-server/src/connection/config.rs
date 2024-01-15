@@ -14,7 +14,6 @@ pub struct DatabaseConfig {
     pub heartbeat_url: Option<Url>,
     pub bottomless_db_id: Option<String>,
     pub jwt_key: Option<String>,
-    #[serde(default)]
     pub allow_attach: bool,
 }
 
