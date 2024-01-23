@@ -283,6 +283,7 @@ pub unsafe extern "C" fn frames<T: Wal>(
     size_after: u32,
     is_commit: c_int,
     sync_flags: c_int,
+    out_frames: *mut c_int,
 ) -> c_int {
     let this = &mut (*(wal as *mut T));
     let mut headers = PageHeaders {
@@ -295,7 +296,12 @@ pub unsafe extern "C" fn frames<T: Wal>(
         is_commit != 0,
         sync_flags,
     ) {
-        Ok(_) => SQLITE_OK,
+        Ok(num_frames) => {
+            if !out_frames.is_null() {
+                *out_frames = num_frames as c_int;
+            }
+            SQLITE_OK
+        }
         Err(code) => code.extended_code,
     }
 }

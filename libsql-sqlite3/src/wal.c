@@ -585,8 +585,8 @@ struct WalIteratorRev {
 #ifdef SQLITE_USE_SEH
 # error "SEH is not supported in libSQL due to virtual WAL backward compatibility!"
 #else
-# define SEH_TRY          
-# define SEH_EXCEPT(X)    
+# define SEH_TRY
+# define SEH_EXCEPT(X)
 # define SEH_INJECT_FAULT
 # define SEH_FREE_ON_ERROR(X,Y)
 # define SEH_SET_ON_ERROR(X,Y)
@@ -1061,7 +1061,14 @@ static u32 walFramePgno(Wal *pWal, u32 iFrame){
   if( iHash==0 ){
     return pWal->apWiData[0][WALINDEX_HDR_SIZE/sizeof(u32) + iFrame - 1];
   }
-  return pWal->apWiData[iHash][(iFrame-1-HASHTABLE_NPAGE_ONE)%HASHTABLE_NPAGE];
+
+  volatile u32 *page;
+  int rc = walIndexPage(pWal, iHash, &page);
+  assert( rc==SQLITE_OK || iHash>0 );
+  if (rc != SQLITE_OK) {
+      return 0;
+  }
+  return page[(iFrame-1-HASHTABLE_NPAGE_ONE)%HASHTABLE_NPAGE];
 }
 
 /*
@@ -2037,6 +2044,7 @@ static int walCheckpoint(
       if( mxSafeFrame>y ){
         assert( y<=pWal->hdr.mxFrame );
         rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(i), 1);
+
         if( rc==SQLITE_OK ){
           u32 iMark = (i==1 ? mxSafeFrame : READMARK_NOT_USED);
           AtomicStore(pInfo->aReadMark+i, iMark); SEH_INJECT_FAULT;
@@ -2094,15 +2102,20 @@ static int walCheckpoint(
           rc = db->mallocFailed ? SQLITE_NOMEM_BKPT : SQLITE_INTERRUPT;
           break;
         }
+
         if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ){
           continue;
         }
+
         iOffset = walFrameOffset(iFrame, szPage) + WAL_FRAME_HDRSIZE;
         /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL file */
         rc = sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset);
         if( rc!=SQLITE_OK ) break;
         iOffset = (iDbpage-1)*(i64)szPage;
         testcase( IS_BIG_INT(iOffset) );
+        /* sqlite in not expecting this page to be checkpointed, but we do,
+         * so we call the callback, but do not write it to the main db file
+         * */
         rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
         if( rc!=SQLITE_OK ) break;
         if (xCb) {
@@ -2995,7 +3008,7 @@ static int sqlite3WalSnapshotRecover(Wal *pWal){
 #endif /* SQLITE_ENABLE_SNAPSHOT */
 
 /*
-** This function does the work of sqlite3WalBeginReadTransaction() (see 
+** This function does the work of sqlite3WalBeginReadTransaction() (see
 ** below). That function simply calls this one inside an SEH_TRY{...} block.
 */
 static int walBeginReadTransaction(Wal *pWal, int *pChanged){
@@ -3296,6 +3309,7 @@ static int sqlite3WalReadFrame(
 */
 static Pgno sqlite3WalDbsize(Wal *pWal){
   if( pWal && ALWAYS(pWal->readLock>=0) ){
+
     return pWal->hdr.nPage;
   }
   return 0;
@@ -3398,12 +3412,12 @@ static int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx)
 
     SEH_TRY {
       /* Restore the clients cache of the wal-index header to the state it
-      ** was in before the client began writing to the database. 
+      ** was in before the client began writing to the database.
       */
       memcpy(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr));
-  
-      for(iFrame=pWal->hdr.mxFrame+1; 
-          ALWAYS(rc==SQLITE_OK) && iFrame<=iMax; 
+
+      for(iFrame=pWal->hdr.mxFrame+1;
+          ALWAYS(rc==SQLITE_OK) && iFrame<=iMax;
           iFrame++
       ){
         /* This call cannot fail. Unless the page for which the page number
@@ -3487,9 +3501,11 @@ static int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
 ** or not pWal->hdr.mxFrame is modified). An SQLite error code is returned
 ** if an error occurs.
 */
-static int walRestartLog(Wal *pWal){
+static int walRestartLog(Wal *pWal, int *pRestarted){
   int rc = SQLITE_OK;
   int cnt;
+
+  *pRestarted = 0;
 
   if( pWal->readLock==0 ){
     volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
@@ -3510,6 +3526,7 @@ static int walRestartLog(Wal *pWal){
         ** to handle if this transaction is rolled back.  */
         walRestartHdr(pWal, salt1);
         walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+        *pRestarted = 1;
       }else if( rc!=SQLITE_BUSY ){
         return rc;
       }
@@ -3657,7 +3674,8 @@ static int walFrames(
   PgHdr *pList,                   /* List of dirty pages to write */
   Pgno nTruncate,                 /* Database size after this commit */
   int isCommit,                   /* True if this is a commit */
-  int sync_flags                  /* Flags to pass to OsSync() (or 0) */
+  int sync_flags,                 /* Flags to pass to OsSync() (or 0) */
+  int *pnFrames                   /* Number of frames written to the wal in the transaction. 0 for non-commit call*/
 ){
   int rc;                         /* Used to catch return codes */
   u32 iFrame;                     /* Next frame address */
@@ -3669,6 +3687,7 @@ static int walFrames(
   WalWriter w;                    /* The writer */
   u32 iFirst = 0;                 /* First frame that may be overwritten */
   WalIndexHdr *pLive;             /* Pointer to shared header */
+  int walRestarted;               /* Whether the wal was restarted */
 
   assert( pList );
   assert( pWal->writeLock );
@@ -3692,7 +3711,7 @@ static int walFrames(
   /* See if it is possible to write these frames into the start of the
   ** log file, instead of appending to it at pWal->hdr.mxFrame.
   */
-  if( SQLITE_OK!=(rc = walRestartLog(pWal)) ){
+  if( SQLITE_OK!=(rc = walRestartLog(pWal, &walRestarted)) ){
     return rc;
   }
 
@@ -3865,6 +3884,17 @@ static int walFrames(
     pWal->hdr.szPage = (u16)((szPage&0xff00) | (szPage>>16));
     testcase( szPage<=32768 );
     testcase( szPage>=65536 );
+    if (pnFrames) {
+        if (isCommit) {
+            if (walRestarted) {
+                *pnFrames = iFrame;
+            } else {
+                *pnFrames = iFrame - pWal->hdr.mxFrame;
+            }
+        } else {
+            *pnFrames = 0;
+        }
+    }
     pWal->hdr.mxFrame = iFrame;
     if( isCommit ){
       pWal->hdr.iChange++;
@@ -3881,7 +3911,7 @@ static int walFrames(
   return rc;
 }
 
-/* 
+/*
 ** Write a set of frames to the log. The caller must hold the write-lock
 ** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
 **
@@ -3894,11 +3924,12 @@ int sqlite3WalFrames(
   PgHdr *pList,                   /* List of dirty pages to write */
   Pgno nTruncate,                 /* Database size after this commit */
   int isCommit,                   /* True if this is a commit */
-  int sync_flags                  /* Flags to pass to OsSync() (or 0) */
+  int sync_flags,                 /* Flags to pass to OsSync() (or 0) */
+  int *pnFrames                   /* OUT: Number of frames appended to the wal on commit */
 ){
   int rc;
   SEH_TRY {
-    rc = walFrames(pWal, szPage, pList, nTruncate, isCommit, sync_flags);
+    rc = walFrames(pWal, szPage, pList, nTruncate, isCommit, sync_flags, pnFrames);
   }
   SEH_EXCEPT( rc = walHandleException(pWal); )
   return rc;
@@ -3994,13 +4025,13 @@ static int sqlite3WalCheckpoint(
         sqlite3OsUnfetch(pWal->pDbFd, 0, 0);
       }
     }
-  
+
     /* Copy data from the log to the database file. */
     if( rc==SQLITE_OK ){
       if( pWal->hdr.mxFrame && walPagesize(pWal)!=nBuf ){
         rc = SQLITE_CORRUPT_BKPT;
       }else{
-        rc = walCheckpoint(pWal, db, eMode2, xBusy2, pBusyArg, sync_flags,zBuf, pCbData, xCb);
+        rc = walCheckpoint(pWal, db, eMode2, xBusy2, pBusyArg, sync_flags, zBuf, pCbData, xCb);
       }
 
       /* If no error occurred, set the output variables. */
@@ -4153,7 +4184,7 @@ static int sqlite3WalSnapshotGet(Wal *pWal, sqlite3_snapshot **ppSnapshot){
 /* Try to open on pSnapshot when the next read-transaction starts
 */
 static void sqlite3WalSnapshotOpen(
-  Wal *pWal, 
+  Wal *pWal,
   sqlite3_snapshot *pSnapshot
 ){
   pWal->pSnapshot = (WalIndexHdr*)pSnapshot;
@@ -4396,6 +4427,8 @@ static int sqlite3WalOpen(
 
 #ifdef SQLITE_ENABLE_ZIPVFS
     outWal->methods.xFramesize = sqlite3WalFramesize;
+
+
 #endif
 
     out->methods.xFile = (sqlite3_file *(*)(wal_impl *))sqlite3WalFile;
@@ -4448,8 +4481,8 @@ RefCountedWalManager* clone_wal_manager(RefCountedWalManager *p) {
     return p;
 }
 
-const libsql_wal_manager sqlite3_wal_manager = { 
-    .pData = NULL, 
+const libsql_wal_manager sqlite3_wal_manager = {
+    .pData = NULL,
     .xOpen = (int (*)(wal_manager_impl *, sqlite3_vfs *, sqlite3_file *, int, long long, const char*, libsql_wal *))sqlite3WalOpen,
     .xClose = (int (*)(wal_manager_impl *, wal_impl *, sqlite3 *, int, int, unsigned char *))sqlite3WalClose,
     .bUsesShm = 1,
@@ -4475,5 +4508,13 @@ RefCountedWalManager *make_sqlite3_wal_manager_rc() {
 }
 
 typedef struct wal_impl wal_impl;
+
+int sqlite3_wal_backfilled(sqlite3_wal *pWal) {
+  return walCkptInfo(pWal)->nBackfill;
+}
+
+u32 sqlite3_wal_frame_page_no(sqlite3_wal *pWal, u32 iFrame) {
+  return walFramePgno(pWal, iFrame);
+}
 
 #endif /* #ifndef SQLITE_OMIT_WAL */

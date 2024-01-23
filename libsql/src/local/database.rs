@@ -53,16 +53,7 @@ impl Database {
         auth_token: String,
         encryption_key: Option<bytes::Bytes>,
     ) -> Result<Database> {
-        Self::open_http_sync_internal(
-            connector,
-            db_path,
-            endpoint,
-            auth_token,
-            None,
-            false,
-            encryption_key,
-        )
-        .await
+        Self::open_http_sync_internal(connector, db_path, endpoint, auth_token, None, false, encryption_key).await
     }
 
     #[cfg(feature = "replication")]
@@ -82,7 +73,7 @@ impl Database {
 
         let mut db = Database::open(&db_path, OpenFlags::default())?;
 
-        let endpoint = coerce_url_scheme(endpoint);
+        let endpoint = coerce_url_scheme(&endpoint);
         let remote = crate::replication::client::Client::new(
             connector,
             endpoint.as_str().try_into().unwrap(),
@@ -91,7 +82,7 @@ impl Database {
         )
         .unwrap();
         let path = PathBuf::from(db_path);
-        let client = RemoteClient::new(remote.clone(), &path)
+        let client = RemoteClient::new(remote.clone())
             .await
             .map_err(|e| crate::errors::Error::ConnectionFailed(e.to_string()))?;
 
@@ -107,18 +98,14 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    pub async fn open_local_sync(
-        db_path: impl Into<String>,
-        flags: OpenFlags,
-        encryption_key: Option<bytes::Bytes>,
-    ) -> Result<Database> {
+    pub async fn open_local_sync(db_path: impl Into<String>, flags: OpenFlags, encryption_key: Option<bytes::Bytes>) -> Result<Database> {
         use std::path::PathBuf;
 
         let db_path = db_path.into();
         let mut db = Database::open(&db_path, flags)?;
 
         let path = PathBuf::from(db_path);
-        let client = LocalClient::new(&path).await.unwrap();
+        let client = LocalClient::new().await.unwrap();
 
         let replicator = EmbeddedReplicator::with_local(client, path, 1000, encryption_key).await;
 
@@ -190,9 +177,9 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    /// Perform a sync step, returning the new replication index, or None, if the nothing was
-    /// replicated yet
-    pub async fn sync_oneshot(&self) -> Result<Option<FrameNo>> {
+    /// Perform a sync step, returning the current replication index, and how many log entries have
+    /// been synced.
+    pub async fn sync_oneshot(&self) -> Result<(FrameNo, usize)> {
         if let Some(ref ctx) = self.replication_ctx {
             ctx.replicator.sync_oneshot().await
         } else {
@@ -204,12 +191,15 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    /// Sync until caught up with primary
+    /// Sync until caught up with primary. Returns the new replication index and how many frames
+    /// have been synced
     // FIXME: there is no guarantee this ever returns!
-    pub async fn sync(&self) -> Result<Option<FrameNo>> {
-        let mut previous_fno = None;
+    pub async fn sync(&self) -> Result<(FrameNo, usize)> {
+        let mut previous_fno = 0;
+        let mut count_synced = 0;
         loop {
-            let new_fno = self.sync_oneshot().await?;
+            let (new_fno, n) = self.sync_oneshot().await?;
+            count_synced += n;
             tracing::trace!("New commited fno: {new_fno:?}");
             if new_fno == previous_fno {
                 break;
@@ -217,11 +207,11 @@ impl Database {
                 previous_fno = new_fno;
             }
         }
-        Ok(previous_fno)
+        Ok((previous_fno, count_synced))
     }
 
     #[cfg(feature = "replication")]
-    pub async fn sync_frames(&self, frames: Frames) -> Result<Option<FrameNo>> {
+    pub async fn sync_frames(&self, frames: Frames) -> Result<FrameNo> {
         if let Some(ref ctx) = self.replication_ctx {
             ctx.replicator.sync_frames(frames).await
         } else {
@@ -233,7 +223,7 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    pub async fn flush_replicator(&self) -> Result<Option<FrameNo>> {
+    pub async fn flush_replicator(&self) -> Result<FrameNo> {
         if let Some(ref ctx) = self.replication_ctx {
             ctx.replicator.flush().await
         } else {

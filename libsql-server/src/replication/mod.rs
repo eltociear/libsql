@@ -1,6 +1,8 @@
 pub mod primary;
 pub mod replicator_client;
 mod snapshot;
+pub mod snapshot_store;
+pub(crate) mod wal;
 
 use crc::Crc;
 pub use primary::logger::{LogReadError, ReplicationLogger};

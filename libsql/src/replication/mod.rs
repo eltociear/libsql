@@ -16,8 +16,6 @@ use tokio::sync::Mutex;
 use crate::parser::Statement;
 use crate::Result;
 
-use libsql_replication::replicator::ReplicatorClient;
-
 pub(crate) use connection::RemoteConnection;
 
 use self::local_client::LocalClient;
@@ -100,7 +98,7 @@ pub(crate) struct EmbeddedReplicator {
 impl EmbeddedReplicator {
     pub async fn with_remote(client: RemoteClient, db_path: PathBuf, auto_checkpoint: u32, encryption_key: Option<bytes::Bytes>) -> Self {
         let replicator = Arc::new(Mutex::new(
-            Replicator::new(Either::Left(client), db_path, auto_checkpoint, encryption_key)
+            Replicator::new(Either::Left(client), db_path, auto_checkpoint, |_| (), encryption_key)
                 .await
                 .unwrap(),
         ));
@@ -110,7 +108,7 @@ impl EmbeddedReplicator {
 
     pub async fn with_local(client: LocalClient, db_path: PathBuf, auto_checkpoint: u32, encryption_key: Option<bytes::Bytes>) -> Self {
         let replicator = Arc::new(Mutex::new(
-            Replicator::new(Either::Right(client), db_path, auto_checkpoint, encryption_key)
+            Replicator::new(Either::Right(client), db_path, auto_checkpoint, |_| (), encryption_key)
                 .await
                 .unwrap(),
         ));
@@ -118,9 +116,8 @@ impl EmbeddedReplicator {
         Self { replicator }
     }
 
-    pub async fn sync_oneshot(&self) -> Result<Option<FrameNo>> {
-        use libsql_replication::replicator::ReplicatorClient;
-
+    /// Returns the new replication index, and how many log entries have been synced
+    pub async fn sync_oneshot(&self) -> Result<(FrameNo, usize)> {
         let mut replicator = self.replicator.lock().await;
         if !matches!(replicator.client_mut(), Either::Left(_)) {
             return Err(crate::errors::Error::Misuse(
@@ -131,6 +128,7 @@ impl EmbeddedReplicator {
         // we force a handshake to get the most up to date replication index from the primary.
         replicator.force_handshake();
 
+        let mut count_synced = 0;
         loop {
             match replicator.replicate().await {
                 Err(libsql_replication::replicator::Error::Meta(
@@ -145,26 +143,25 @@ impl EmbeddedReplicator {
                         .map_err(|e| crate::Error::Replication(e.into()))?;
                 }
                 Err(e) => return Err(crate::Error::Replication(e.into())),
-                Ok(_) => {
+                Ok(n) => {
+                    count_synced += n;
                     let Either::Left(client) = replicator.client_mut() else {
                         unreachable!()
                     };
                     let Some(primary_index) = client.last_handshake_replication_index() else {
-                        return Ok(None);
+                        break;
                     };
-                    if let Some(replica_index) = replicator.client_mut().committed_frame_no() {
-                        if replica_index >= primary_index {
-                            break;
-                        }
+                    if replicator.current_commit_index() >= primary_index {
+                        break;
                     }
                 }
             }
         }
 
-        Ok(replicator.client_mut().committed_frame_no())
+        Ok((replicator.current_commit_index(), count_synced))
     }
 
-    pub async fn sync_frames(&self, frames: Frames) -> Result<Option<FrameNo>> {
+    pub async fn sync_frames(&self, frames: Frames) -> Result<FrameNo> {
         let mut replicator = self.replicator.lock().await;
 
         match replicator.client_mut() {
@@ -182,23 +179,19 @@ impl EmbeddedReplicator {
             .await
             .map_err(|e| crate::Error::Replication(e.into()))?;
 
-        Ok(replicator.client_mut().committed_frame_no())
+        Ok(replicator.current_commit_index())
     }
 
-    pub async fn flush(&self) -> Result<Option<FrameNo>> {
+    pub async fn flush(&self) -> Result<FrameNo> {
         let mut replicator = self.replicator.lock().await;
         replicator
             .flush()
             .await
             .map_err(|e| crate::Error::Replication(e.into()))?;
-        Ok(replicator.client_mut().committed_frame_no())
+        Ok(replicator.current_commit_index())
     }
 
     pub async fn committed_frame_no(&self) -> Option<FrameNo> {
-        self.replicator
-            .lock()
-            .await
-            .client_mut()
-            .committed_frame_no()
+        todo!()
     }
 }

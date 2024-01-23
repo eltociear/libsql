@@ -16,10 +16,8 @@ use tokio::sync::{
     watch::{self, Receiver, Sender},
 };
 
-use crate::connection::config::DatabaseConfig;
-use crate::{
-    config::MetaStoreConfig, connection::libsql::open_conn_active_checkpoint, error::Error, Result,
-};
+use crate::connection::{config::DatabaseConfig, libsql::open_conn_enable_checkpoint};
+use crate::{config::MetaStoreConfig, error::Error, Result};
 
 use super::NamespaceName;
 
@@ -206,7 +204,7 @@ impl MetaStore {
                     }
                 }
 
-                Some(replicator)
+                Some(Arc::new(std::sync::Mutex::new(Some(replicator))))
             }
             None => None,
         };
@@ -215,7 +213,7 @@ impl MetaStore {
             replicator.map(BottomlessWalWrapper::new),
             Sqlite3WalManager::default(),
         );
-        let conn = open_conn_active_checkpoint(&db_path, wal_manager.clone(), None, 1000, None)?;
+        let conn = open_conn_enable_checkpoint(&db_path, wal_manager.clone(), None, 1000, None)?;
 
         let configs = restore(&conn)?;
 

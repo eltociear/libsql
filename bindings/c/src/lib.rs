@@ -155,7 +155,12 @@ pub unsafe extern "C" fn libsql_open_remote(
             return 2;
         }
     };
-    match libsql::Database::open_remote(url, auth_token) {
+    match RT.block_on(libsql::Database::open_with_remote_sync(
+        url.to_string(),
+        url,
+        auth_token,
+        None,
+    )) {
         Ok(db) => {
             let db = Box::leak(Box::new(libsql_database { db }));
             *out_db = libsql_database_t::from(db);

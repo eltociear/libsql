@@ -69,10 +69,8 @@ pub fn build_bundled(out_dir: &str, out_path: &Path) {
     let dir = env!("CARGO_MANIFEST_DIR");
     std::fs::copy(format!("{dir}/{bindgen_rs_path}"), out_path).unwrap();
 
-    println!("cargo:rerun-if-changed={BUNDLED_DIR}/src/sqlite3.c");
     let mut cfg = cc::Build::new();
     cfg.file(format!("{BUNDLED_DIR}/src/sqlite3.c"))
-        .flag("-std=c11")
         .flag("-DSQLITE_CORE")
         .flag("-DSQLITE_DEFAULT_FOREIGN_KEYS=1")
         .flag("-DSQLITE_ENABLE_API_ARMOR")

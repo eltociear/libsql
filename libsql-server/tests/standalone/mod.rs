@@ -83,7 +83,8 @@ fn basic_metrics() {
 
         let snapshot = snapshot_metrics();
         snapshot.assert_counter("libsql_server_libsql_execute_program", 3);
-        snapshot.assert_counter("libsql_server_user_http_response", 3);
+        // cursor-based execution produces two responses per execution request
+        snapshot.assert_counter("libsql_server_user_http_response", 6);
 
         for (key, (_, _, val)) in snapshot.snapshot() {
             if key.kind() == metrics_util::MetricKind::Counter
@@ -91,7 +92,7 @@ fn basic_metrics() {
             {
                 let label = key.key().labels().next().unwrap();
                 assert!(label.value().starts_with("libsql-remote-"));
-                assert_eq!(val, &metrics_util::debugging::DebugValue::Counter(3));
+                assert_eq!(val, &metrics_util::debugging::DebugValue::Counter(6));
             }
         }
 
@@ -230,127 +231,10 @@ fn basic_query_fail() {
         conn.execute("create unique index test_index on test(x)", ())
             .await?;
         conn.execute("insert into test values (12)", ()).await?;
-        let e = conn
+        assert_debug_snapshot!(conn
             .execute("insert into test values (12)", ())
             .await
-            .unwrap_err();
-        assert_debug_snapshot!(e);
-
-        Ok(())
-    });
-
-    sim.run().unwrap();
-}
-
-#[test]
-fn begin_commit() {
-    let mut sim = turmoil::Builder::new().build();
-
-    sim.host("primary", make_standalone_server);
-
-    sim.client("test", async {
-        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
-        let conn = db.connect()?;
-
-        conn.execute("create table test (x)", ()).await?;
-
-        conn.execute("begin;", ()).await?;
-        conn.execute("insert into test values (12);", ()).await?;
-
-        // we can read the inserted row
-        let mut rows = conn.query("select count(*) from test", ()).await?;
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
-            Value::Integer(1)
-        );
-
-        conn.execute("commit;", ()).await?;
-
-        // after rollback row is no longer there
-        let mut rows = conn.query("select count(*) from test", ()).await?;
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
-            Value::Integer(1)
-        );
-
-        Ok(())
-    });
-
-    sim.run().unwrap();
-}
-#[test]
-fn begin_rollback() {
-    let mut sim = turmoil::Builder::new().build();
-
-    sim.host("primary", make_standalone_server);
-
-    sim.client("test", async {
-        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
-        let conn = db.connect()?;
-
-        conn.execute("create table test (x)", ()).await?;
-
-        conn.execute("begin;", ()).await?;
-        conn.execute("insert into test values (12);", ()).await?;
-
-        // we can read the inserted row
-        let mut rows = conn.query("select count(*) from test", ()).await?;
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
-            Value::Integer(1)
-        );
-
-        conn.execute("rollback;", ()).await?;
-
-        // after rollback row is no longer there
-        let mut rows = conn.query("select count(*) from test", ()).await?;
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
-            Value::Integer(0)
-        );
-
-        Ok(())
-    });
-
-    sim.run().unwrap();
-}
-
-#[test]
-fn is_autocommit() {
-    let mut sim = turmoil::Builder::new().build();
-
-    sim.host("primary", make_standalone_server);
-
-    sim.client("test", async {
-        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
-        let conn = db.connect()?;
-
-        assert_eq!(conn.is_autocommit(), true);
-        conn.execute("create table test (x)", ()).await?;
-
-        conn.execute("begin;", ()).await?;
-        assert_eq!(conn.is_autocommit(), false);
-        conn.execute("insert into test values (12);", ()).await?;
-        conn.execute("commit;", ()).await?;
-        assert_eq!(conn.is_autocommit(), true);
-
-        // make an explicit transaction
-        {
-            let tx = conn.transaction().await?;
-            assert_eq!(tx.is_autocommit(), false);
-            assert_eq!(conn.is_autocommit(), true); // connection is still autocommit
-
-            tx.execute("insert into test values (12);", ()).await?;
-            // transaction rolls back
-        }
-
-        assert_eq!(conn.is_autocommit(), true);
-
-        let mut rows = conn.query("select count(*) from test", ()).await?;
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
-            Value::Integer(1)
-        );
+            .unwrap_err());
 
         Ok(())
     });

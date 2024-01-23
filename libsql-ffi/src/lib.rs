@@ -13,7 +13,7 @@ pub use libsql_wasm::{
     libsql_compile_wasm_module, libsql_free_wasm_module, libsql_run_wasm, libsql_wasm_engine_new,
 };
 
-include!(concat!(env!("OUT_DIR"), "/bindgen.rs"));
+include!("../bundled/bindings/bindgen.rs");
 
 #[must_use]
 pub fn SQLITE_STATIC() -> sqlite3_destructor_type {
@@ -67,6 +67,38 @@ impl<'a> std::iter::Iterator for PageHdrIter<'a> {
         let current_hdr: &PgHdr = unsafe { &*self.current_ptr };
         let raw_data =
             unsafe { std::slice::from_raw_parts(current_hdr.pData as *const u8, self.page_size) };
+        let item = Some((current_hdr.pgno, raw_data));
+        self.current_ptr = current_hdr.pDirty;
+        item
+    }
+}
+
+pub struct PageHdrIterMut<'a> {
+    current_ptr: *mut PgHdr,
+    page_size: usize,
+    _pth: PhantomData<&'a ()>,
+}
+
+impl<'a> PageHdrIterMut<'a> {
+    pub fn new(current_ptr: *mut PgHdr, page_size: usize) -> Self {
+        Self {
+            current_ptr,
+            page_size,
+            _pth: PhantomData,
+        }
+    }
+}
+
+impl<'a> std::iter::Iterator for PageHdrIterMut<'a> {
+    type Item = (u32, &'a mut [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_ptr.is_null() {
+            return None;
+        }
+        let current_hdr: &PgHdr = unsafe { &*self.current_ptr };
+        let raw_data =
+            unsafe { std::slice::from_raw_parts_mut(current_hdr.pData as *mut u8, self.page_size) };
         let item = Some((current_hdr.pgno, raw_data));
         self.current_ptr = current_hdr.pDirty;
         item

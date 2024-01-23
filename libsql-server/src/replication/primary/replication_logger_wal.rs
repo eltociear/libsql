@@ -30,10 +30,6 @@ impl ReplicationLoggerWalManager {
             logger,
         }
     }
-
-    pub fn logger(&self) -> Arc<ReplicationLogger> {
-        self.logger.clone()
-    }
 }
 
 impl WalManager for ReplicationLoggerWalManager {
@@ -118,7 +114,9 @@ impl ReplicationLoggerWal {
     fn commit(&self) -> anyhow::Result<()> {
         let new_frame_no = self.logger.commit()?;
         tracing::trace!("new frame committed {new_frame_no:?}");
-        self.logger.new_frame_notifier.send_replace(new_frame_no);
+        self.logger
+            .new_frame_notifier
+            .send_replace(new_frame_no.unwrap_or(0));
         Ok(())
     }
 
@@ -185,7 +183,7 @@ impl Wal for ReplicationLoggerWal {
         size_after: u32,
         is_commit: bool,
         sync_flags: c_int,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         assert_eq!(page_size, 4096);
         let iter = page_headers.iter();
         for (page_no, data) in iter {
@@ -197,8 +195,9 @@ impl Wal for ReplicationLoggerWal {
             return Err(rusqlite::ffi::Error::new(SQLITE_IOERR));
         }
 
-        self.inner
-            .insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)?;
+        let num_frames =
+            self.inner
+                .insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)?;
 
         if is_commit {
             if let Err(e) = self.commit() {
@@ -221,7 +220,7 @@ impl Wal for ReplicationLoggerWal {
             }
         }
 
-        Ok(())
+        Ok(num_frames)
     }
 
     fn checkpoint(
@@ -236,16 +235,8 @@ impl Wal for ReplicationLoggerWal {
         backfilled: Option<&mut i32>,
     ) -> Result<()> {
         self.inject_replication_index(db)?;
-        self.inner.checkpoint(
-            db,
-            mode,
-            busy_handler,
-            sync_flags,
-            buf,
-            checkpoint_cb,
-            in_wal,
-            backfilled,
-        )
+        self.inner
+            .checkpoint(db, mode, busy_handler, sync_flags, buf, checkpoint_cb, in_wal, backfilled)
     }
 
     fn exclusive_mode(&mut self, op: c_int) -> Result<()> {
@@ -264,8 +255,20 @@ impl Wal for ReplicationLoggerWal {
         self.inner.callback()
     }
 
-    fn last_fame_index(&self) -> u32 {
-        self.inner.last_fame_index()
+    fn frames_in_wal(&self) -> u32 {
+        self.inner.frames_in_wal()
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        self.inner.db_file()
+    }
+
+    fn backfilled(&self) -> u32 {
+        self.inner.backfilled()
+    }
+
+    fn frame_page_no(&self, frame_no: NonZeroU32) -> Option<NonZeroU32> {
+        self.inner.frame_page_no(frame_no)
     }
 }
 
@@ -285,7 +288,7 @@ impl ReplicationLoggerWal {
 
         let header = Sqlite3DbHeader::mut_from_prefix(data).expect("invalid database header");
         header.replication_index =
-            (self.logger().new_frame_notifier.borrow().unwrap_or(0) + 1).into();
+            (*self.logger().new_frame_notifier.borrow() + 1).into();
         #[cfg(feature = "encryption")]
         let pager = libsql_sys::connection::leak_pager(db.as_ptr());
         #[cfg(not(feature = "encryption"))]
@@ -328,10 +331,7 @@ impl ReplicationLoggerWal {
 
 #[cfg(test)]
 mod test {
-    use libsql_sys::wal::{
-        wrapper::{WalWrapper, WrapWal},
-        CheckpointMode,
-    };
+    use libsql_sys::wal::wrapper::{WalWrapper, WrapWal};
     use metrics::atomics::AtomicU64;
     use rusqlite::ffi::{sqlite3_wal_checkpoint_v2, SQLITE_CHECKPOINT_FULL};
     use tempfile::tempdir;
@@ -351,11 +351,10 @@ mod test {
             fn checkpoint(
                 &mut self,
                 wrapped: &mut ReplicationLoggerWal,
-                db: &mut super::Sqlite3Db,
-                mode: CheckpointMode,
+                db: &mut libsql_sys::wal::Sqlite3Db,
+                mode: libsql_sys::wal::CheckpointMode,
                 busy_handler: Option<&mut dyn BusyHandler>,
                 sync_flags: u32,
-                // temporary scratch buffer
                 buf: &mut [u8],
                 checkpoint_cb: Option<&mut dyn CheckpointCallback>,
                 in_wal: Option<&mut i32>,
@@ -400,7 +399,7 @@ mod test {
             verify_replication_index.clone(),
             ReplicationLoggerWalManager::new(logger.clone()),
         );
-        let db = crate::connection::libsql::open_conn_active_checkpoint(
+        let db = crate::connection::libsql::open_conn_enable_checkpoint(
             tmp.path(),
             wal_manager,
             None,
@@ -429,7 +428,7 @@ mod test {
             verify_replication_index
                 .0
                 .load(std::sync::atomic::Ordering::Relaxed),
-            logger.new_frame_notifier.borrow().unwrap()
+            *logger.new_frame_notifier.borrow()
         );
     }
 
@@ -449,7 +448,7 @@ mod test {
         );
 
         let wal_manager = ReplicationLoggerWalManager::new(logger.clone());
-        let db = crate::connection::libsql::open_conn_active_checkpoint(
+        let db = crate::connection::libsql::open_conn_enable_checkpoint(
             tmp.path(),
             wal_manager,
             None,

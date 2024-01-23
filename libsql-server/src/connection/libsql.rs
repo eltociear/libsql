@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use libsql_sys::wal::wrapper::{WalWrapper, WrapWal, WrappedWal};
+use libsql_sys::wal::wrapper::{WrapWal, WrappedWal};
 use libsql_sys::wal::{BusyHandler, CheckpointCallback, Wal, WalManager};
 use metrics::{histogram, increment_counter};
 use once_cell::sync::Lazy;
@@ -32,7 +32,7 @@ use super::program::{Cond, DescribeCol, DescribeParam, DescribeResponse};
 use super::{MakeConnection, Program, Step};
 
 pub struct MakeLibSqlConn<T: WalManager> {
-    db_path: PathBuf,
+    db_path: Arc<Path>,
     wal_manager: T,
     stats: Arc<Stats>,
     config_store: MetaStoreHandle,
@@ -40,7 +40,7 @@ pub struct MakeLibSqlConn<T: WalManager> {
     max_response_size: u64,
     max_total_response_size: u64,
     auto_checkpoint: u32,
-    current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+    current_frame_no_receiver: watch::Receiver<FrameNo>,
     state: Arc<TxnState<T::Wal>>,
     /// In wal mode, closing the last database takes time, and causes other databases creation to
     /// return sqlite busy. To mitigate that, we hold on to one connection
@@ -55,7 +55,7 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        db_path: PathBuf,
+        db_path: Arc<Path>,
         wal_manager: T,
         stats: Arc<Stats>,
         config_store: MetaStoreHandle,
@@ -63,7 +63,7 @@ where
         max_response_size: u64,
         max_total_response_size: u64,
         auto_checkpoint: u32,
-        current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+        current_frame_no_receiver: watch::Receiver<FrameNo>,
         encryption_key: Option<bytes::Bytes>,
     ) -> Result<Self> {
         let mut this = Self {
@@ -173,29 +173,50 @@ impl<T> std::fmt::Debug for LibSqlConnection<T> {
 }
 
 #[derive(Clone, Copy)]
-pub struct InhibitCheckpointWalWrapper;
+pub struct InhibitCheckpointWalWrapper {
+    close_only: bool,
+}
+
+impl InhibitCheckpointWalWrapper {
+    pub fn new(close_only: bool) -> Self {
+        Self { close_only }
+    }
+}
 
 impl<W: Wal> WrapWal<W> for InhibitCheckpointWalWrapper {
     fn checkpoint(
         &mut self,
-        _wrapped: &mut W,
-        _db: &mut libsql_sys::wal::Sqlite3Db,
-        _mode: libsql_sys::wal::CheckpointMode,
-        _busy_handler: Option<&mut dyn BusyHandler>,
-        _sync_flags: u32,
-        _buf: &mut [u8],
-        _checkpoint_cb: Option<&mut dyn CheckpointCallback>,
-        _in_wal: Option<&mut i32>,
-        _backfilled: Option<&mut i32>,
+        wrapped: &mut W,
+        db: &mut libsql_sys::wal::Sqlite3Db,
+        mode: libsql_sys::wal::CheckpointMode,
+        busy_handler: Option<&mut dyn BusyHandler>,
+        sync_flags: u32,
+        buf: &mut [u8],
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
+        in_wal: Option<&mut i32>,
+        backfilled: Option<&mut i32>,
     ) -> libsql_sys::wal::Result<()> {
-        tracing::warn!(
-            "checkpoint inhibited: this connection is not allowed to perform checkpoints"
-        );
-        Err(rusqlite::ffi::Error::new(SQLITE_BUSY))
+        if !self.close_only {
+            wrapped.checkpoint(
+                db,
+                mode,
+                busy_handler,
+                sync_flags,
+                buf,
+                checkpoint_cb,
+                in_wal,
+                backfilled,
+            )
+        } else {
+            tracing::warn!(
+                "checkpoint inhibited: this connection is not allowed to perform checkpoints"
+            );
+            Err(rusqlite::ffi::Error::new(SQLITE_BUSY))
+        }
     }
 
     fn close<M: WalManager<Wal = W>>(
-        &self,
+        &mut self,
         manager: &M,
         wrapped: &mut W,
         db: &mut libsql_sys::wal::Sqlite3Db,
@@ -230,14 +251,14 @@ where
     libsql_sys::Connection::open(
         path.join("data"),
         flags,
-        WalWrapper::new(InhibitCheckpointWalWrapper, wal_manager),
+        wal_manager.wrap(InhibitCheckpointWalWrapper::new(false)),
         u32::MAX,
         encryption_key,
     )
 }
 
 /// Same as open_conn, but with checkpointing activated.
-pub fn open_conn_active_checkpoint<T>(
+pub fn open_conn_enable_checkpoint<T>(
     path: &Path,
     wal_manager: T,
     flags: Option<OpenFlags>,
@@ -274,7 +295,7 @@ where
         stats: Arc<Stats>,
         config_store: MetaStoreHandle,
         builder_config: QueryBuilderConfig,
-        current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+        current_frame_no_receiver: watch::Receiver<FrameNo>,
         state: Arc<TxnState<W>>,
     ) -> crate::Result<Self>
     where
@@ -334,7 +355,7 @@ where
 #[cfg(test)]
 impl LibSqlConnection<libsql_sys::wal::Sqlite3Wal> {
     pub fn new_test(path: &Path) -> Self {
-        let (_snd, rcv) = watch::channel(None);
+        let (_snd, rcv) = watch::channel(0);
         let conn = Connection::new(
             path,
             Arc::new([]),
@@ -358,7 +379,7 @@ struct Connection<T> {
     stats: Arc<Stats>,
     config_store: MetaStoreHandle,
     builder_config: QueryBuilderConfig,
-    current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+    current_frame_no_receiver: watch::Receiver<FrameNo>,
     // must be dropped after the connection because the connection refers to it
     state: Arc<TxnState<T>>,
     // current txn slot if any
@@ -538,10 +559,10 @@ impl<W: Wal> Connection<W> {
         stats: Arc<Stats>,
         config_store: MetaStoreHandle,
         builder_config: QueryBuilderConfig,
-        current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
+        current_frame_no_receiver: watch::Receiver<FrameNo>,
         state: Arc<TxnState<W>>,
     ) -> Result<Self> {
-        let conn = open_conn_active_checkpoint(
+        let conn = open_conn_enable_checkpoint(
             path,
             wal_manager,
             None,
@@ -1058,7 +1079,7 @@ mod test {
             stats: Arc::new(Stats::default()),
             config_store: MetaStoreHandle::new_test(),
             builder_config: QueryBuilderConfig::default(),
-            current_frame_no_receiver: watch::channel(None).1,
+            current_frame_no_receiver: watch::channel(0).1,
             state: Default::default(),
             slot: None,
         };
@@ -1093,7 +1114,7 @@ mod test {
             100000000,
             100000000,
             DEFAULT_AUTO_CHECKPOINT,
-            watch::channel(None).1,
+            watch::channel(0).1,
             None,
         )
         .await
@@ -1135,7 +1156,7 @@ mod test {
             100000000,
             100000000,
             DEFAULT_AUTO_CHECKPOINT,
-            watch::channel(None).1,
+            watch::channel(0).1,
             None,
         )
         .await
@@ -1178,7 +1199,7 @@ mod test {
             100000000,
             100000000,
             DEFAULT_AUTO_CHECKPOINT,
-            watch::channel(None).1,
+            watch::channel(0).1,
             None,
         )
         .await
@@ -1257,7 +1278,7 @@ mod test {
             100000000,
             100000000,
             DEFAULT_AUTO_CHECKPOINT,
-            watch::channel(None).1,
+            watch::channel(0).1,
             None,
         )
         .await

@@ -26,3 +26,6 @@ rusqlite = ["dep:rusqlite"]
 wasmtime-bindings = ["libsql-ffi/wasmtime-bindings"]
 unix-excl-vfs = []
 encryption = ["libsql-ffi/multiple-ciphers"]
+
+[dev-dependencies]
+tempfile = "3.9.0"
